@@ -1,12 +1,13 @@
 """
 Economic Calendar Telegram Bot — Don Milton
-Fuente   : Financial Modeling Prep API (economic calendar, impact=High, USD)
+Fuente   : Forex Factory XML feed (nfs.faireconomy.media) — sin API key, sin JS
 Envío    : Telegram Bot API
 Scheduler: GitHub Actions
-Lógica   : Rolling window — desde hoy hasta el viernes de la semana
+Lógica   : Rolling window — desde hoy hasta el viernes
 """
 
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import pytz
 import os
@@ -15,8 +16,10 @@ import sys
 # ─────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-FMP_API_KEY      = os.environ.get("FMP_API_KEY", "")
 TIMEZONE         = "America/Santiago"
+
+FF_XML_THIS_WEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+FF_XML_NEXT_WEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.xml"
 # ─────────────────────────────────────────────────────────────────
 
 
@@ -32,77 +35,112 @@ def get_remaining_weekdays():
     return days
 
 
-def fetch_fmp_events(days):
-    """
-    Llama a FMP economic calendar API para el rango de días.
-    Filtra: currency=USD, impact=High.
-    Retorna dict {date: [events]}
-    """
-    from_date = days[0].strftime("%Y-%m-%d")
-    to_date   = days[-1].strftime("%Y-%m-%d")
+def fetch_xml(url):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/xml,text/xml,*/*",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        print(f"[INFO] {url} → HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            return None
+        if "<!DOCTYPE" in resp.text[:100] or "Request Denied" in resp.text:
+            print(f"[WARN] Forex Factory bloqueó la solicitud: {resp.text[:200]}")
+            return None
+        return resp.text
+    except requests.RequestException as e:
+        print(f"[ERROR] Request fallida para {url}: {e}")
+        return None
 
-    url = (
-        f"https://financialmodelingprep.com/api/v3/economic_calendar"
-        f"?from={from_date}&to={to_date}&apikey={FMP_API_KEY}"
-    )
 
-    print(f"[INFO] Consultando FMP: {from_date} → {to_date}")
+def parse_ff_xml(xml_text, target_days):
+    """
+    Parsea el XML de Forex Factory y retorna dict {date: [events]}
+    Solo eventos USD con impact=High.
+    """
+    result = {d: [] for d in target_days}
 
     try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"[ERROR] FMP request fallida: {e}")
-        return {d: [] for d in days}
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        print(f"[ERROR] XML inválido: {e}")
+        print(f"[DEBUG] Primeros 300 chars: {xml_text[:300]}")
+        return result
 
-    data = resp.json()
+    # El XML tiene elementos <event> o <eventdata> según la versión
+    events = root.findall("event") or root.findall("eventdata") or root.findall(".//event")
+    print(f"[INFO] Eventos totales en XML: {len(events)}")
 
-    if isinstance(data, dict) and "Error Message" in data:
-        print(f"[ERROR] FMP respondió: {data['Error Message']}")
-        return {d: [] for d in days}
+    for ev in events:
+        # Campos del XML de Forex Factory
+        country = (ev.findtext("country") or "").strip().upper()
+        impact  = (ev.findtext("impact")  or "").strip().lower()
+        title   = (ev.findtext("title")   or ev.findtext("name") or "—").strip()
+        date_s  = (ev.findtext("date")    or "").strip()
+        time_s  = (ev.findtext("time")    or "All Day").strip()
+        forecast = (ev.findtext("forecast") or "—").strip() or "—"
+        previous = (ev.findtext("previous") or "—").strip() or "—"
+        actual   = (ev.findtext("actual")   or "—").strip() or "—"
 
-    print(f"[INFO] FMP devolvió {len(data)} eventos en total")
-
-    result = {d: [] for d in days}
-
-    for item in data:
-        # Filtrar solo USD high impact
-        currency = item.get("currency", "")
-        impact   = item.get("impact", "").lower()
-
-        if currency != "USD" or impact != "high":
+        if country != "USD" or impact != "high":
             continue
 
-        # Parsear fecha del evento
-        event_date_str = item.get("date", "")
+        # Parsear fecha — FF usa formato "May 28, 2026"
         try:
-            event_dt   = datetime.strptime(event_date_str[:10], "%Y-%m-%d").date()
+            ev_date = datetime.strptime(date_s, "%b %d, %Y").date()
         except ValueError:
+            # Intentar formato alternativo "05-28-2026"
+            try:
+                ev_date = datetime.strptime(date_s, "%m-%d-%Y").date()
+            except ValueError:
+                print(f"[WARN] No se pudo parsear fecha: '{date_s}'")
+                continue
+
+        if ev_date not in result:
             continue
 
-        if event_dt not in result:
-            continue
-
-        # Hora (viene como "2026-05-28 08:30:00" o similar)
-        try:
-            time_str = datetime.strptime(event_date_str, "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
-        except ValueError:
-            time_str = "All Day"
-
-        result[event_dt].append({
-            "time"    : time_str,
-            "event"   : item.get("event", "—"),
-            "actual"  : str(item.get("actual",   "")) or "—",
-            "forecast": str(item.get("estimate", "")) or "—",
-            "previous": str(item.get("previous", "")) or "—",
+        result[ev_date].append({
+            "time"    : time_s,
+            "event"   : title,
+            "forecast": forecast,
+            "previous": previous,
+            "actual"  : actual,
         })
 
-    # Ordenar eventos de cada día por hora
-    for d in result:
-        result[d].sort(key=lambda x: x["time"])
+    for d in target_days:
         print(f"[INFO] {d.strftime('%a %d/%m')}: {len(result[d])} eventos HIGH USD")
 
     return result
+
+
+def get_events(days):
+    """
+    Descarga el XML correcto según si es domingo o día de semana.
+    Domingo → usa nextweek; resto → thisweek.
+    """
+    tz  = pytz.timezone(TIMEZONE)
+    wd  = datetime.now(tz).weekday()  # 6 = Domingo
+
+    if wd == 6:
+        # Domingo: intentar nextweek primero, luego thisweek como fallback
+        print("[INFO] Es domingo — intentando nextweek.xml")
+        xml = fetch_xml(FF_XML_NEXT_WEEK)
+        if not xml:
+            print("[WARN] nextweek.xml no disponible, usando thisweek.xml")
+            xml = fetch_xml(FF_XML_THIS_WEEK)
+    else:
+        xml = fetch_xml(FF_XML_THIS_WEEK)
+
+    if not xml:
+        print("[ERROR] No se pudo obtener el XML de Forex Factory.")
+        return {d: [] for d in days}
+
+    return parse_ff_xml(xml, days)
 
 
 def escape_md(text):
@@ -183,12 +221,9 @@ def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[ERROR] Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID.")
         sys.exit(1)
-    if not FMP_API_KEY:
-        print("[ERROR] Falta FMP_API_KEY.")
-        sys.exit(1)
 
     days          = get_remaining_weekdays()
-    events_by_day = fetch_fmp_events(days)
+    events_by_day = get_events(days)
     message       = format_message(days, events_by_day)
     send_telegram(message)
 
