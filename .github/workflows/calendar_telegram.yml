@@ -2,20 +2,15 @@ name: Economic Calendar — Telegram Bot
 
 on:
   schedule:
-    # ─────────────────────────────────────────────────────────────
-    # Todos los tiempos en UTC. Chile (America/Santiago) = UTC-3
-    # 07:00 Santiago = 10:00 UTC  (horario normal, abril-sept)
-    # 09:00 PM Santiago domingo   = 00:00 UTC lunes
-    # ─────────────────────────────────────────────────────────────
-
     # Domingo 21:00 Santiago → Lunes 00:00 UTC
     - cron: '0 0 * * 1'
-
     # Lunes a Viernes 07:00 Santiago → 10:00 UTC
     - cron: '0 10 * * 1-5'
 
-  # Permite ejecución manual desde la pestaña Actions
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   send-calendar:
@@ -32,12 +27,11 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar dependencias
-        run: |
-          pip install requests beautifulsoup4 pytz
+        run: pip install requests pytz
 
       - name: Ejecutar bot
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python economic_calendar_telegram.py
+          FMP_API_KEY:      ${{ secrets.FMP_API_KEY }}
+        run: python economic_calendar_telegram.py
