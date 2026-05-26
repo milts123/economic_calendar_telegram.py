@@ -1,13 +1,12 @@
 """
 Economic Calendar Telegram Bot — Don Milton
-Fuente   : Forex Factory (scraping, vista semanal)
+Fuente   : Financial Modeling Prep API (economic calendar, impact=High, USD)
 Envío    : Telegram Bot API
 Scheduler: GitHub Actions
-Lógica   : Rolling window — muestra desde hoy hasta el viernes
+Lógica   : Rolling window — desde hoy hasta el viernes de la semana
 """
 
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pytz
 import os
@@ -16,6 +15,7 @@ import sys
 # ─────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+FMP_API_KEY      = os.environ.get("FMP_API_KEY", "")
 TIMEZONE         = "America/Santiago"
 # ─────────────────────────────────────────────────────────────────
 
@@ -32,121 +32,75 @@ def get_remaining_weekdays():
     return days
 
 
-def scrape_week_events(days):
+def fetch_fmp_events(days):
     """
-    Scrapea Forex Factory con la vista semanal (1 request para toda la semana).
+    Llama a FMP economic calendar API para el rango de días.
+    Filtra: currency=USD, impact=High.
     Retorna dict {date: [events]}
     """
-    # Usar el lunes de la semana como anchor
-    anchor = days[0]
-    # Retroceder al lunes si no lo es
-    while anchor.weekday() != 0:
-        anchor -= timedelta(days=1)
+    from_date = days[0].strftime("%Y-%m-%d")
+    to_date   = days[-1].strftime("%Y-%m-%d")
 
-    url = f"https://www.forexfactory.com/calendar?week={anchor.strftime('%b%d.%Y').lower()}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection":      "keep-alive",
-        "Cache-Control":   "no-cache",
-    }
+    url = (
+        f"https://financialmodelingprep.com/api/v3/economic_calendar"
+        f"?from={from_date}&to={to_date}&apikey={FMP_API_KEY}"
+    )
 
-    print(f"[INFO] Scrapeando: {url}")
+    print(f"[INFO] Consultando FMP: {from_date} → {to_date}")
+
     try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        print(f"[INFO] Status HTTP: {resp.status_code}")
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
     except requests.RequestException as e:
-        print(f"[ERROR] Request fallida: {e}")
+        print(f"[ERROR] FMP request fallida: {e}")
         return {d: [] for d in days}
 
-    if resp.status_code != 200:
-        print(f"[WARN] Forex Factory respondió {resp.status_code}. Posible bloqueo Cloudflare.")
-        print(f"[DEBUG] Body primeros 300 chars: {resp.text[:300]}")
+    data = resp.json()
+
+    if isinstance(data, dict) and "Error Message" in data:
+        print(f"[ERROR] FMP respondió: {data['Error Message']}")
         return {d: [] for d in days}
 
-    # Detectar bloqueo Cloudflare silencioso
-    if "cf-browser-verification" in resp.text or "Just a moment" in resp.text:
-        print("[WARN] Cloudflare está bloqueando la solicitud.")
-        return {d: [] for d in days}
+    print(f"[INFO] FMP devolvió {len(data)} eventos en total")
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    rows = soup.select("tr.calendar__row")
-    print(f"[INFO] Rows encontradas en el HTML: {len(rows)}")
+    result = {d: [] for d in days}
 
-    if len(rows) == 0:
-        print("[WARN] No se encontraron rows. El HTML puede haber cambiado.")
-        print(f"[DEBUG] Primeros 500 chars del body: {resp.text[:500]}")
+    for item in data:
+        # Filtrar solo USD high impact
+        currency = item.get("currency", "")
+        impact   = item.get("impact", "").lower()
 
-    # Inicializar resultado
-    result      = {d: [] for d in days}
-    current_row_date = None
-    current_time = ""
-
-    for row in rows:
-        classes = row.get("class", [])
-
-        # Detectar row de cambio de día
-        if "calendar__row--day-breaker" in classes:
-            date_el = row.select_one("td span.calendar__date")
-            if date_el:
-                date_text = date_el.get_text(strip=True)
-                # Parsear fecha (ej: "Tue May 27")
-                try:
-                    parsed = datetime.strptime(f"{date_text} {anchor.year}", "%a %b %d %Y").date()
-                    current_row_date = parsed
-                    current_time = ""
-                except ValueError:
-                    pass
+        if currency != "USD" or impact != "high":
             continue
 
-        if current_row_date is None or current_row_date not in result:
+        # Parsear fecha del evento
+        event_date_str = item.get("date", "")
+        try:
+            event_dt   = datetime.strptime(event_date_str[:10], "%Y-%m-%d").date()
+        except ValueError:
             continue
 
-        # Moneda
-        currency_el = row.select_one("td.calendar__currency")
-        if not currency_el or currency_el.get_text(strip=True) != "USD":
+        if event_dt not in result:
             continue
 
-        # Impacto — buscar span con clase que contenga "high"
-        impact_el = row.select_one("td.calendar__impact span")
-        if not impact_el:
-            continue
-        impact_classes = " ".join(impact_el.get("class", [])).lower()
-        if "high" not in impact_classes:
-            continue
+        # Hora (viene como "2026-05-28 08:30:00" o similar)
+        try:
+            time_str = datetime.strptime(event_date_str, "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
+        except ValueError:
+            time_str = "All Day"
 
-        # Hora
-        time_el = row.select_one("td.calendar__time")
-        if time_el:
-            t = time_el.get_text(strip=True)
-            if t:
-                current_time = t
-
-        # Nombre
-        event_el   = row.select_one("td.calendar__event span.calendar__event-title")
-        event_name = event_el.get_text(strip=True) if event_el else "—"
-
-        def get_val(cls):
-            el = row.select_one(f"td.{cls}")
-            return el.get_text(strip=True) if el else "—"
-
-        result[current_row_date].append({
-            "time"    : current_time or "All Day",
-            "event"   : event_name,
-            "forecast": get_val("calendar__forecast") or "—",
-            "previous": get_val("calendar__previous") or "—",
-            "actual"  : get_val("calendar__actual")   or "—",
+        result[event_dt].append({
+            "time"    : time_str,
+            "event"   : item.get("event", "—"),
+            "actual"  : str(item.get("actual",   "")) or "—",
+            "forecast": str(item.get("estimate", "")) or "—",
+            "previous": str(item.get("previous", "")) or "—",
         })
 
-    # Log resumen
-    for d in days:
-        print(f"[INFO] {d.strftime('%a %d/%m')}: {len(result[d])} eventos high-impact USD")
+    # Ordenar eventos de cada día por hora
+    for d in result:
+        result[d].sort(key=lambda x: x["time"])
+        print(f"[INFO] {d.strftime('%a %d/%m')}: {len(result[d])} eventos HIGH USD")
 
     return result
 
@@ -190,7 +144,11 @@ def format_message(days, events_by_day):
             lines.append("   ✅ Sin eventos high impact")
         else:
             for ev in events:
-                actual_str = f" \\| Act: `{escape_md(ev['actual'])}`" if ev["actual"] not in ("—","","Actual") else ""
+                actual_str = (
+                    f" \\| Act: `{escape_md(ev['actual'])}`"
+                    if ev["actual"] not in ("—", "", "None")
+                    else ""
+                )
                 lines.append(
                     f"   🕐 `{escape_md(ev['time'])}` — *{escape_md(ev['event'])}*\n"
                     f"   Prev: `{escape_md(ev['previous'])}` \\| Fcst: `{escape_md(ev['forecast'])}`{actual_str}"
@@ -213,7 +171,7 @@ def send_telegram(message):
         resp.raise_for_status()
         print("✅ Mensaje enviado a Telegram")
     except requests.RequestException as e:
-        print(f"[ERROR] Fallo al enviar a Telegram: {e}")
+        print(f"[ERROR] Telegram: {e}")
         try:
             print(f"[RESP ] {resp.text}")
         except Exception:
@@ -225,10 +183,13 @@ def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[ERROR] Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID.")
         sys.exit(1)
+    if not FMP_API_KEY:
+        print("[ERROR] Falta FMP_API_KEY.")
+        sys.exit(1)
 
-    days         = get_remaining_weekdays()
-    events_by_day = scrape_week_events(days)
-    message      = format_message(days, events_by_day)
+    days          = get_remaining_weekdays()
+    events_by_day = fetch_fmp_events(days)
+    message       = format_message(days, events_by_day)
     send_telegram(message)
 
 
